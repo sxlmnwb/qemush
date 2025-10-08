@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===============================================
+# qemush - startx
+# Installing your custom VM Linux with QEMU
+# Author: @sxlmnwb <sxlmnwb.dev@gmail.com>
+# ===============================================
+
+# --- Locate helper files ---
+LOG_FILE="./libs/logging.sh"
+TOOLS_FILE="./libs/check-tools.sh"
+CONFIG_FILE="./config/env.sh"
+
+# --- Verify helper files ---
+if [[ ! -f "$LOG_FILE" ]]; then
+    echo -e "$(date +"%Y-%m-%dT%H:%M:%S.%3N") \e[31mERR\e[0m missing file=$LOG_FILE"
+    exit 1
+fi
+source "$LOG_FILE"
+
+if [[ ! -f "$TOOLS_FILE" ]]; then
+    log_err "missing file=$TOOLS_FILE"
+    exit 1
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    log_err "missing file=$CONFIG_FILE"
+    exit 1
+fi
+
+log_inf "checking and installing required tools"
+if ! bash "$TOOLS_FILE"; then
+    log_err "aborting startx"
+    exit 1
+fi
+
+# --- Load configuration ---
+log_inf "setting configuration from $CONFIG_FILE"
+source "$CONFIG_FILE"
+log_inf "configuration loaded successfully"
+
+# --- Display loaded configuration ---
+mkdir -p "$VM_DIR"
+VM_MOUNT_DEV=$(df -h "$VM_DIR" 2>/dev/null | awk 'NR==2 {print $1}')
+
+echo -e "\e[31m"
+cat <<'QEMUSH'
+                                .▄▄▄  ▄▄▄ .• ▌ ▄ ·. ▄• ▄▌.▄▄ ·  ▄ .▄
+                                ▐▀•▀█ ▀▄.▀··██ ▐███▪█▪██▌▐█ ▀. ██▪▐█
+                                █▌·.█▌▐▀▀▪▄▐█ ▌▐▌▐█·█▌▐█▌▄▀▀▀█▄██▀▐█
+                                ▐█▪▄█·▐█▄▄▌██ ██▌▐█▌▐█▄█▌▐█▄▪▐███▌▐▀
+                                ·▀▀█.  ▀▀▀ ▀▀  █▪▀▀▀ ▀▀▀  ▀▀▀▀ ▀▀▀ ·
+QEMUSH
+echo -e "\e[0m"
+cat <<'DESC'
+                       A portable customize virtualization machine with @qemu
+                              Build on GNU bash // Maintainer @sxlmnwb
+
+DESC
+cat <<EOF
+Virtualization Setup:
+Image URL:            $IMG_URL
+    VM Directory:     $VM_DIR (${VM_MOUNT_DEV:-unknown})
+Root Disk Size:       $ROOT_DISK_SIZE
+    Data Disk Size:   $DATA_DISK_SIZE
+    Swap Memory:      $SWAP_SIZE
+    Memory:           $MEMORY
+CPU(s):               $CPUS
+
+EOF
+
+# --- Confirm before proceeding ---
+echo -ne "$(date +"%Y-%m-%dT%H:%M:%S.%3N") \e[33mOPTION\e[0m do you want to continue? [y/N]: "
+read -r confirm
+case "$confirm" in
+    [yY]|[yY][eE][sS])
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+# --- Dynamic QEMU params ---
+QEMU_PARAMS=(
+    -drive "file=$IMG_FILE,format=qcow2,if=virtio,cache=writeback"
+    -drive "file=$DATA_DISK,format=qcow2,if=virtio,cache=writeback"
+    -drive "file=$SEED_FILE,format=raw,if=virtio"
+    -boot order=c
+    -device virtio-net-pci,netdev=net0
+    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22"
+    -nographic
+    -serial mon:stdio
+)
+
+# ----------------------------------- #
+#  VM IMAGE SETUP ------------------- #
+# ----------------------------------- #
+cd "$VM_DIR"
+
+if [[ ! -f "$IMG_FILE" ]]; then
+    log_inf "downloading image → $IMG_FILE"
+    wget -q --show-progress "$IMG_URL" -O "$IMG_FILE"
+
+    log_inf "expanding image to ${ROOT_DISK_SIZE}"
+    qemu-img resize -f qcow2 "$IMG_FILE" "$ROOT_DISK_SIZE"
+
+    log_inf "creating cloud-init seed (user-data & meta-data)"
+    cat > user-data <<EOF
+#cloud-config
+hostname: $HOSTNAME
+manage_etc_hosts: true
+disable_root: false
+ssh_pwauth: true
+package_update: true
+package_upgrade: false
+packages:
+  - openssh-server
+  - cloud-guest-utils
+
+chpasswd:
+  list: |
+    $USERNAME:$PASSWORD
+  expire: false
+
+users:
+  - default
+  - name: $USERNAME
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin, sudo
+    shell: /bin/bash
+
+runcmd:
+  - echo "$USERNAME:$PASSWORD" | chpasswd
+  - mkdir -p /var/run/sshd
+  - systemctl enable ssh
+  - systemctl start ssh
+  - fallocate -l $SWAP_SIZE /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
+
+growpart:
+  mode: auto
+  ignore_growroot_disabled: false
+resize_rootfs: true
+EOF
+
+    cat > meta-data <<EOF
+instance-id: iid-qemush001
+local-hostname: $HOSTNAME
+EOF
+
+    cloud-localds "$SEED_FILE" user-data meta-data
+    log_ok "cloud-init seed created successfully"
+else
+    log_inf "base image already exists — skipping download"
+fi
+
+# ----------------------------------- #
+#  DATA DISK SETUP ------------------ #
+# ----------------------------------- #
+if [[ ! -f "$DATA_DISK" ]]; then
+    log_inf "creating data disk (${DATA_DISK_SIZE})"
+    qemu-img create -f qcow2 "$DATA_DISK" "$DATA_DISK_SIZE"
+else
+    log_inf "data disk already exists — skipping creation"
+fi
+# ----------------------------------- #
+# CLEANUP HANDLER ------------------- #
+# ----------------------------------- #
+cleanup() {
+    log_inf "gracefully shutting down VM"
+    pkill -f "qemu-system-x86_64" 2>/dev/null || true
+}
+trap cleanup SIGINT SIGTERM
+
+
+# ----------------------------------- #
+#  START VM ------------------------- #
+# ----------------------------------- #
+if [[ -e /dev/kvm ]]; then
+    ACCELERATION_FLAG="-enable-kvm -cpu host"
+    log_inf "KVM acceleration detected — enabled"
+else
+    ACCELERATION_FLAG="-accel tcg"
+    log WARN "KVM not available — using software emulation (slower)"
+fi
+
+log_inf "starting QEMU instance → $IMG_FILE"
+log_inf "after booting, connect via: ssh $USERNAME@localhost -p $SSH_PORT"
+log_inf "or press any key to access the console"
+sleep 3
+
+exec qemu-system-x86_64 \
+    $ACCELERATION_FLAG \
+    -m "$MEMORY" \
+    -smp "$CPUS" \
+    "${QEMU_PARAMS[@]}"
